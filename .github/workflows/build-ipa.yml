@@ -1,0 +1,152 @@
+name: Build unsigned Immich IPA
+
+# Immich publishes Android APKs on every release but ships iOS only through
+# TestFlight and the App Store. This builds an unsigned IPA from each upstream
+# release tag, the same way upstream's own build-sign-ios job does minus the
+# signing, and attaches it to a release here under the same tag. Sideloading
+# stores (AltStore, SideStore, Feather) re-sign it on install.
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'immich-app/immich tag to build (blank = latest release)'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild and replace the asset even if this tag was already built'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Pick upstream tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag=$(gh api repos/immich-app/immich/releases/latest --jq .tag_name)
+          fi
+          # The tag reaches shell commands and a release name; accept only
+          # upstream's own tag shape.
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "refusing unexpected tag '$tag'" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != "true" ] && gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "$tag is already built"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ needs.check.outputs.tag }}
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    # Upstream's iOS job runs on this image; matching it avoids Xcode drift.
+    runs-on: xcode-27
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Select Xcode 27.1
+        run: sudo xcode-select -s /Applications/Xcode_27.1.app/Contents/Developer
+
+      - name: Checkout immich-app/immich ${{ needs.check.outputs.tag }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: immich-app/immich
+          ref: ${{ needs.check.outputs.tag }}
+          path: immich
+          persist-credentials: false
+
+      - name: Setup Mise
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          github_token: ${{ github.token }}
+          working_directory: ./immich/mobile
+          cache_key_prefix: ./immich/mobile
+          install_args: '--locked'
+          export_path: false
+          version: 2026.10.5
+
+      - name: Install dependencies
+        working-directory: immich
+        run: mise //mobile:install:ci
+
+      - name: Perform codegen
+        working-directory: immich
+        run: mise //mobile:codegen
+
+      - name: Trust Swift macros and package plugins
+        # CI has no one to click "Trust & Enable"; upstream passes
+        # -skipMacroValidation to xcodebuild for the same reason.
+        run: |
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES
+
+      - name: Build (no codesign)
+        working-directory: immich/mobile
+        run: mise exec -- flutter build ios --release --no-codesign
+
+      - name: Package IPA
+        working-directory: immich/mobile/build/ios/iphoneos
+        run: |
+          set -euo pipefail
+          app=$(find . -maxdepth 1 -name '*.app' -type d | head -n1)
+          [ -n "$app" ] || { echo "no .app produced" >&2; exit 1; }
+          plist="$app/Info.plist"
+          echo "bundle id: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")"
+          echo "version:   $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist") ($(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist"))"
+          rm -rf Payload && mkdir Payload && cp -R "$app" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload "$GITHUB_WORKSPACE/Immich-$TAG.ipa"
+          ls -l "$GITHUB_WORKSPACE/Immich-$TAG.ipa"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ipa="Immich-$TAG.ipa"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ipa" --clobber -R "$GITHUB_REPOSITORY"
+            exit 0
+          fi
+          # Not an array: an empty "${a[@]}" is an unbound variable under
+          # set -u in macOS's bash 3.2.
+          prerelease=""
+          case "$TAG" in *-rc.*) prerelease="--prerelease" ;; esac
+          notes=$(printf '%s\n' \
+            "Unsigned iOS build of [immich-app/immich $TAG](https://github.com/immich-app/immich/releases/tag/$TAG)," \
+            "built from the unmodified source at that tag by [this workflow run]($RUN_URL)." \
+            "" \
+            "It is not signed: install it through a store that re-signs on install (AltStore, SideStore, Feather)." \
+            "" \
+            "Immich is licensed AGPL-3.0; the corresponding source is the upstream tag above.")
+          gh release create "$TAG" "$ipa" -R "$GITHUB_REPOSITORY" \
+            --title "Immich $TAG (unsigned IPA)" --notes "$notes" $prerelease
