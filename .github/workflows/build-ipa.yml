@@ -84,16 +84,31 @@ jobs:
           path: immich
           persist-credentials: false
 
+      - name: Resolve upstream's mise version for this tag
+        id: mise
+        # Each tag's lockfile matches the mise release upstream built it with
+        # (newer mise reads older lockfiles as incomplete), so take the
+        # version from the tag's own build-mobile.yml -> devtools use-mise.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(grep -oE 'immich-app/devtools/actions/use-mise@[0-9a-f]{40}' immich/.github/workflows/build-mobile.yml | head -n1 | cut -d@ -f2)
+          [ -n "$sha" ] || { echo "no use-mise reference in build-mobile.yml" >&2; exit 1; }
+          action=$(gh api "repos/immich-app/devtools/contents/actions/use-mise/action.yml?ref=$sha" --jq .content | base64 --decode)
+          version=$(printf '%s\n' "$action" | sed -nE 's/^[[:space:]]*version:[[:space:]]*"?([0-9]+\.[0-9]+\.[0-9]+)"?.*/\1/p' | head -n1)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "could not read the mise version from devtools@$sha" >&2; exit 1; }
+          echo "mise $version (devtools@$sha)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Setup Mise
         uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           github_token: ${{ github.token }}
           working_directory: ./immich/mobile
           cache_key_prefix: ./immich/mobile
-          export_path: false
-          # No --locked: upstream's mise.lock has no macOS entry for java, which
-          # --locked refuses. Every tool the lockfile does cover is still pinned.
-          version: 2026.10.5
+          install_args: '--locked'
+          version: ${{ steps.mise.outputs.version }}
 
       - name: Install dependencies
         working-directory: immich
