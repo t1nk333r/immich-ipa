@@ -90,8 +90,9 @@ jobs:
           github_token: ${{ github.token }}
           working_directory: ./immich/mobile
           cache_key_prefix: ./immich/mobile
-          install_args: '--locked'
           export_path: false
+          # No --locked: upstream's mise.lock has no macOS entry for java, which
+          # --locked refuses. Every tool the lockfile does cover is still pinned.
           version: 2026.10.5
 
       - name: Install dependencies
